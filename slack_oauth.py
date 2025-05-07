@@ -1,86 +1,122 @@
-# slack_oauth.py
 import os
-from fastapi import FastAPI, Request, HTTPException,Cookie
-from fastapi.responses import RedirectResponse, HTMLResponse
-from dotenv import load_dotenv
-import httpx
+import json
+from typing import Optional, Dict
+from fastapi import HTTPException, Request
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 from jose import jwt
 from datetime import datetime, timedelta
-from tinydb import TinyDB, Query
-import os
+import httpx
 
-load_dotenv()
+# Initialize Slack client
+slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
 
-app = FastAPI()
+def get_login_url() -> str:
+    """Generate the Slack OAuth login URL."""
+    client_id = os.getenv("SLACK_CLIENT_ID")
+    redirect_uri = os.getenv("SLACK_REDIRECT_URI")
+    return f"https://slack.com/oauth/v2/authorize?client_id={client_id}&scope=identity.basic,identity.email,identity.avatar&redirect_uri={redirect_uri}"
 
-SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID")
-SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET")
-SLACK_REDIRECT_URI = os.getenv("SLACK_REDIRECT_URI")
-JWT_SECRET = os.getenv("SECRET_KEY")
-JWT_ALGORITHM = "HS256"
+async def handle_slack_oauth(code: str) -> Dict:
+    """Handle the OAuth callback from Slack."""
+    client_id = os.getenv("SLACK_CLIENT_ID")
+    client_secret = os.getenv("SLACK_CLIENT_SECRET")
+    redirect_uri = os.getenv("SLACK_REDIRECT_URI")
 
-db = TinyDB('users.json')
-users_table = db.table('users')
+    try:
+        # Exchange code for access token
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://slack.com/api/oauth.v2.access",
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "code": code,
+                    "redirect_uri": redirect_uri
+                }
+            )
+            data = response.json()
 
-def create_jwt(slack_id, email):
+        if not data.get("ok"):
+            raise HTTPException(status_code=400, detail="Failed to get access token")
+
+        # Get user info
+        user_info = await get_user_info(data["authed_user"]["access_token"])
+        
+        # Create JWT token
+        token = create_jwt(user_info)
+        
+        return {
+            "access_token": token,
+            "user": user_info
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+async def get_user_info(access_token: str) -> Dict:
+    """Get user information from Slack."""
+    try:
+        async with httpx.AsyncClient() as client:
+            # Get user identity
+            identity_response = await client.get(
+                "https://slack.com/api/users.identity",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            identity_data = identity_response.json()
+
+            if not identity_data.get("ok"):
+                raise HTTPException(status_code=400, detail="Failed to get user info")
+
+            # Get team info
+            team_response = await client.get(
+                "https://slack.com/api/team.info",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            team_data = team_response.json()
+
+            if not team_data.get("ok"):
+                raise HTTPException(status_code=400, detail="Failed to get team info")
+
+            return {
+                "id": identity_data["user"]["id"],
+                "email": identity_data["user"]["email"],
+                "name": identity_data["user"]["name"],
+                "team": {
+                    "id": team_data["team"]["id"],
+                    "name": team_data["team"]["name"],
+                    "domain": team_data["team"]["domain"]
+                }
+            }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+def create_jwt(user_info: Dict) -> str:
+    """Create a JWT token for the user."""
+    secret = os.getenv("JWT_SECRET")
+    if not secret:
+        raise HTTPException(status_code=500, detail="JWT_SECRET not configured")
+
     payload = {
-        "slack_id": slack_id,
-        "email": email,
-        "exp": datetime.utcnow() + timedelta(hours=12)
+        "sub": user_info["id"],
+        "email": user_info["email"],
+        "name": user_info["name"],
+        "exp": datetime.utcnow() + timedelta(days=1)
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-@app.get("/login/slack")
-def login_slack():
-    slack_auth_url = (
-        "https://slack.com/oauth/v2/authorize"
-        f"?client_id={SLACK_CLIENT_ID}"
-        f"&scope=identity.basic,identity.email"
-        f"&redirect_uri={SLACK_REDIRECT_URI}"
-    )
-    return RedirectResponse(slack_auth_url)
+    return jwt.encode(payload, secret, algorithm="HS256")
 
-@app.get("/slack/oauth/callback")
-async def slack_oauth_callback(code: str):
-    async with httpx.AsyncClient() as client:
-        token_resp = await client.post(
-            "https://slack.com/api/oauth.v2.access",
-            data={
-                "client_id": SLACK_CLIENT_ID,
-                "client_secret": SLACK_CLIENT_SECRET,
-                "code": code,
-                "redirect_uri": SLACK_REDIRECT_URI,
-            },
-        )
-        token_data = token_resp.json()
-        if not token_data.get("ok"):
-            raise HTTPException(status_code=400, detail="Slack OAuth failed")
+def verify_token(token: str) -> Dict:
+    """Verify and decode a JWT token."""
+    secret = os.getenv("JWT_SECRET")
+    if not secret:
+        raise HTTPException(status_code=500, detail="JWT_SECRET not configured")
 
-        access_token = token_data["authed_user"]["access_token"]
-
-        user_resp = await client.get(
-            "https://slack.com/api/users.identity",
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        user_data = user_resp.json()
-        if not user_data.get("ok"):
-            raise HTTPException(status_code=400, detail="Failed to fetch user info")
-
-        slack_id = user_data["user"]["id"]
-        email = user_data["user"]["email"]
-        name = user_data["user"]["name"]
-
-        # Store or update user in TinyDB
-        User = Query()
-        if users_table.get(User.slack_id == slack_id):
-            users_table.update({'email': email, 'name': name}, User.slack_id == slack_id)
-        else:
-            users_table.insert({'slack_id': slack_id, 'email': email, 'name': name})
-
-        # Create JWT and set as cookie
-        token = create_jwt(slack_id, email)
-        response = RedirectResponse(url="/dashboard")
-        response.set_cookie(key="session", value=token, httponly=True, secure=True)
-        return response
-
-
+    try:
+        payload = jwt.decode(token, secret, algorithms=["HS256"])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")

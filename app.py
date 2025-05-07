@@ -2,7 +2,8 @@ import os
 from datetime import datetime
 from typing import Optional
 import fitz  # PyMuPDF
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.responses import RedirectResponse
 from slack_bolt import App
 from slack_bolt.adapter.fastapi import SlackRequestHandler
 from dotenv import load_dotenv
@@ -14,6 +15,8 @@ import json
 from pydantic import BaseModel
 import requests
 import traceback
+from slack_oauth import handle_slack_oauth, get_login_url, verify_token, create_jwt
+from slack_sdk.errors import SlackApiError
 
 # Configure logging with more detail and better formatting
 logging.basicConfig(
@@ -52,6 +55,11 @@ openai.api_key = os.environ.get("OPENAI_API_KEY")
 MONTHLY_LIMIT = 10
 UPGRADE_LINK = "https://yoursite.com/upgrade"
 
+# Add new environment variables
+SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID")
+SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET")
+SLACK_REDIRECT_URI = os.getenv("SLACK_REDIRECT_URI")
+
 class PDFRequest(BaseModel):
     pdf_url: str
 
@@ -79,23 +87,33 @@ async def health_check():
         }
     }
 
-def get_user_status(user_id: str) -> dict:
+def get_user_status(user_id: str, email: str = None, team_id: str = None) -> dict:
     """Get or create user status."""
     User = Query()
-    user = users.get(User.user_id == user_id)
+    user = users.get((User.user_id == user_id) & (User.team_id == team_id))
     if not user:
         user = {
             'user_id': user_id,
+            'team_id': team_id,
+            'email': email,
             'status': 'free',
-            'created_at': datetime.now().isoformat()
+            'created_at': datetime.now().isoformat(),
+            'last_login': datetime.now().isoformat()
         }
         users.insert(user)
+    elif email and user.get('email') != email:
+        # Update email if it has changed
+        users.update({
+            'email': email,
+            'last_login': datetime.now().isoformat()
+        }, (User.user_id == user_id) & (User.team_id == team_id))
+        user['email'] = email
     return user
 
-def check_usage_limit(user_id: str) -> bool:
+def check_usage_limit(user_id: str, team_id: str) -> bool:
     """Check if user has exceeded monthly limit."""
     User = Query()
-    user = get_user_status(user_id)
+    user = get_user_status(user_id, team_id=team_id)
     
     if user['status'] == 'pro':
         return True
@@ -104,17 +122,23 @@ def check_usage_limit(user_id: str) -> bool:
     Usage = Query()
     monthly_usage = usage.count(
         (Usage.user_id == user_id) & 
+        (Usage.team_id == team_id) &
         (Usage.month == current_month)
     )
     
     return monthly_usage < MONTHLY_LIMIT
 
-def record_usage(user_id: str):
+def record_usage(user_id: str, team_id: str, file_name: str = None):
     """Record a usage instance."""
+    user = get_user_status(user_id, team_id=team_id)
     usage.insert({
         'user_id': user_id,
+        'team_id': team_id,
+        'email': user.get('email'),
         'month': datetime.now().strftime('%Y-%m'),
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat(),
+        'file_name': file_name,
+        'user_status': user['status']
     })
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
@@ -191,20 +215,22 @@ def generate_summary(text: str) -> str:
         raise
 
 @slack_app.event("app_mention")
-def handle_mention(event, say, client):
+async def handle_mention(event, say, client):
     """Handle app mention events."""
     logger.info("="*80)
     logger.info("📥 Received new app mention event")
     logger.info(f"👤 From user: {event.get('user')}")
+    logger.info(f"🏢 In workspace: {event.get('team')}")
     
     user_id = event['user']
+    team_id = event['team']
     temp_files = []  # Keep track of temporary files to clean up
     
     try:
         # Check if user has exceeded limit
-        if not check_usage_limit(user_id):
+        if not check_usage_limit(user_id, team_id):
             logger.warning(f"⚠️ User {user_id} has exceeded their monthly limit")
-            say(
+            await say(
                 thread_ts=event['ts'],
                 text=f"You've hit your monthly limit of {MONTHLY_LIMIT} summaries. Upgrade to Pro to continue: {UPGRADE_LINK}"
             )
@@ -213,7 +239,7 @@ def handle_mention(event, say, client):
         # Check for file attachments
         if 'files' not in event:
             logger.warning("⚠️ No files attached in mention")
-            say(
+            await say(
                 thread_ts=event['ts'],
                 text="Please upload a PDF file for summarization."
             )
@@ -225,7 +251,7 @@ def handle_mention(event, say, client):
             if file['filetype'] != 'pdf':
                 logger.warning(f"⚠️ Non-PDF file received: {file['filetype']}")
                 continue
-                
+            
             try:
                 # Download file
                 logger.info(f"🔍 Getting file info for: {file['id']}")
@@ -261,7 +287,7 @@ def handle_mention(event, say, client):
                     temp_file_path = f"temp_{file['id']}.pdf"
                     with open(temp_file_path, 'wb') as f:
                         f.write(file_response.content)
-                    temp_files.append(temp_file_path)  # Add to cleanup list
+                    temp_files.append(temp_file_path)
                     logger.info(f"✅ File downloaded successfully. Size: {len(file_response.content)} bytes")
                 except Exception as e:
                     logger.error(f"❌ Error downloading file: {str(e)}")
@@ -287,21 +313,15 @@ def handle_mention(event, say, client):
                     raise
                 
                 # Record usage
-                record_usage(user_id)
+                record_usage(user_id, team_id, file['name'])
                 
                 # Send summary
                 logger.info("📤 Sending summary to Slack")
-                say(
+                await say(
                     thread_ts=event['ts'],
                     text=f"Here's the summary of {file['name']}:\n\n{summary}"
                 )
                 logger.info(f"✅ Successfully processed and summarized {file['name']}")
-                
-                # Send success message
-                say(
-                    thread_ts=event['ts'],
-                    text=f"✨ Successfully processed {file['name']}!"
-                )
                 
             except Exception as e:
                 error_details = {
@@ -312,7 +332,7 @@ def handle_mention(event, say, client):
                 logger.error("❌ Error processing file:")
                 logger.error(json.dumps(error_details, indent=2))
                 
-                say(
+                await say(
                     thread_ts=event['ts'],
                     text=f"Sorry, I encountered an error processing {file['name']}. Please try again."
                 )
@@ -363,8 +383,106 @@ async def endpoint(request: Request):
             logger.info(f"✅ Received challenge: {body_json['challenge']}")
             return {"challenge": body_json["challenge"]}
             
-        # Let the SlackRequestHandler process other events
-        return await handler.handle(request)
+        # Log event type
+        if "event" in body_json:
+            event_type = body_json['event'].get('type')
+            logger.info(f"📝 Received event type: {event_type}")
+            
+            # For app_mention events, we need to check if there are files
+            if event_type == "app_mention":
+                # Get the thread_ts if it exists
+                thread_ts = body_json['event'].get('thread_ts') or body_json['event'].get('ts')
+                
+                # Check if there are files in the event
+                if 'files' not in body_json['event']:
+                    logger.info("⚠️ No files in the event")
+                    return {"ok": True}
+                
+                # Process the files
+                for file in body_json['event']['files']:
+                    logger.info(f"📄 Processing file: {file.get('name')}")
+                    if file.get('filetype') != 'pdf':
+                        logger.info(f"⚠️ Non-PDF file received: {file.get('filetype')}")
+                        continue
+                    
+                    try:
+                        # Download file
+                        response = slack_app.client.files_info(file=file['id'])
+                        if not response.get('ok'):
+                            logger.error(f"❌ Slack API error: {response.get('error')}")
+                            raise Exception(f"Slack API error: {response.get('error')}")
+                            
+                        file_url = response['file']['url_private_download']
+                        logger.info(f"⬇️ Downloading file from: {file_url}")
+                        
+                        # Download the file
+                        logger.info(f"⬇️ Downloading file from: {file_url}")
+                        try:
+                            # Get file info first
+                            file_info = slack_app.client.files_info(file=file['id'])
+                            if not file_info.get('ok'):
+                                raise Exception(f"Failed to get file info: {file_info.get('error')}")
+                            
+                            # Download the file using the private URL
+                            file_url = file_info['file']['url_private_download']
+                            file_response = requests.get(
+                                file_url,
+                                headers={'Authorization': f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"}
+                            )
+                            
+                            if file_response.status_code != 200:
+                                raise Exception(f"Failed to download file: HTTP {file_response.status_code}")
+                            
+                            # Save the file temporarily
+                            temp_file_path = f"temp_{file['id']}.pdf"
+                            with open(temp_file_path, 'wb') as f:
+                                f.write(file_response.content)
+                            logger.info(f"✅ File downloaded successfully. Size: {len(file_response.content)} bytes")
+                        except Exception as e:
+                            logger.error(f"❌ Error downloading file: {str(e)}")
+                            raise
+                        
+                        # Extract text and generate summary
+                        logger.info("📝 Starting text extraction from PDF")
+                        try:
+                            pdf_text = extract_text_from_pdf(file_response.content)
+                            logger.info(f"✅ Text extraction completed. Length: {len(pdf_text)} characters")
+                        except Exception as e:
+                            logger.error(f"❌ Error extracting text from PDF: {str(e)}")
+                            raise
+                        
+                        logger.info("🤖 Generating summary")
+                        summary = generate_summary(pdf_text)
+                        logger.info(f"✅ Summary generated successfully. Length: {len(summary)} characters")
+                        
+                        # Record usage
+                        record_usage(body_json['event']['user'], body_json['event']['team'], file.get('name'))
+                        
+                        # Send summary
+                        logger.info("📤 Sending summary to Slack")
+                        slack_app.client.chat_postMessage(
+                            channel=body_json['event']['channel'],
+                            thread_ts=thread_ts,
+                            text=f"Here's the summary of {file.get('name')}:\n\n{summary}"
+                        )
+                        logger.info(f"✅ Successfully processed and summarized {file.get('name')}")
+                        
+                    except Exception as e:
+                        error_details = {
+                            "error_type": type(e).__name__,
+                            "error_message": str(e),
+                            "traceback": traceback.format_exc()
+                        }
+                        logger.error("❌ Error processing file:")
+                        logger.error(json.dumps(error_details, indent=2))
+                        
+                        slack_app.client.chat_postMessage(
+                            channel=body_json['event']['channel'],
+                            thread_ts=thread_ts,
+                            text=f"Sorry, I encountered an error processing {file.get('name')}. Please try again."
+                        )
+            
+        return {"ok": True}
         
     except json.JSONDecodeError as e:
         logger.error(f"❌ Failed to parse request body: {e}")
@@ -375,8 +493,64 @@ async def endpoint(request: Request):
     
     logger.info("="*80)
 
+@app.get("/login")
+async def login():
+    """Redirect to Slack OAuth login."""
+    return RedirectResponse(get_login_url())
+
+@app.get("/slack/oauth/callback")
+async def slack_oauth_callback(code: str):
+    """Handle Slack OAuth callback."""
+    try:
+        # Handle OAuth callback
+        result = await handle_slack_oauth(code)
+        
+        # Store user info in database
+        user_info = result['user']
+        user = get_user_status(user_info['id'], user_info['email'], user_info['team']['id'])
+        
+        # Create response with token
+        response = RedirectResponse(url="/dashboard")
+        response.set_cookie(
+            key="access_token",
+            value=result['access_token'],
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            max_age=86400  # 1 day
+        )
+        return response
+    except Exception as e:
+        logger.error(f"OAuth callback error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Add authentication dependency
+async def get_current_user(request: Request):
+    """Get current user from session token."""
+    token = request.cookies.get("session")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    try:
+        user_info = verify_token(token)
+        return user_info
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+# Add protected dashboard endpoint
+@app.get("/dashboard")
+async def dashboard(user: dict = Depends(get_current_user)):
+    """Protected dashboard endpoint."""
+    return {
+        "user": {
+            "slack_id": user["slack_id"],
+            "email": user["email"]
+        },
+        "status": "authenticated"
+    }
+
 @app.post("/process-pdf")
-async def process_pdf(request: PDFRequest):
+async def process_pdf(request: PDFRequest, user: dict = Depends(get_current_user)):
     """Process a PDF from a URL and return its summary."""
     try:
         # Download the PDF
@@ -390,11 +564,179 @@ async def process_pdf(request: PDFRequest):
         
         return {
             "status": "success",
-            "summary": summary
+            "summary": summary,
+            "user": user["slack_id"]
         }
     except Exception as e:
         logger.error(f"Error processing PDF: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+def init_db():
+    """Initialize database with proper schema."""
+    # Ensure users table has required fields
+    User = Query()
+    if not users.get(User.user_id.exists()):
+        users.insert({
+            'user_id': 'admin',
+            'team_id': 'admin_workspace',
+            'email': 'admin@example.com',
+            'status': 'pro',
+            'created_at': datetime.now().isoformat(),
+            'last_login': datetime.now().isoformat()
+        })
+    
+    # Ensure usage table has required fields
+    Usage = Query()
+    if not usage.get(Usage.user_id.exists()):
+        usage.insert({
+            'user_id': 'admin',
+            'team_id': 'admin_workspace',
+            'month': datetime.now().strftime('%Y-%m'),
+            'timestamp': datetime.now().isoformat(),
+            'file_name': 'test.pdf'
+        })
+
+# Initialize database schema
+init_db()
+
+@slack_app.event("app_home_opened")
+async def handle_app_home_opened(event, say, client):
+    """Handle app home opened event."""
+    try:
+        user_id = event["user"]
+        team_id = event["team_id"]
+        
+        # Get user status
+        user = get_user_status(user_id, team_id=team_id)
+        
+        # Check if user is authenticated
+        if user.get('email'):
+            # Show authenticated view
+            await client.views_publish(
+                user_id=user_id,
+                view={
+                    "type": "home",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"Welcome back, <@{user_id}>!"
+                            }
+                        },
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"Your usage this month: {get_monthly_usage(user_id, team_id)}/10"
+                            }
+                        },
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": {
+                                        "type": "plain_text",
+                                        "text": "Upgrade to Pro"
+                                    },
+                                    "action_id": "upgrade_button"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            )
+        else:
+            # Show unauthenticated view
+            await client.views_publish(
+                user_id=user_id,
+                view={
+                    "type": "home",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "Welcome to PDF Summarizer!"
+                            }
+                        },
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": {
+                                        "type": "plain_text",
+                                        "text": "Login with Slack"
+                                    },
+                                    "action_id": "login_button"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            )
+    except Exception as e:
+        logger.error(f"Error handling app home opened: {str(e)}")
+        raise
+
+@slack_app.action("login_button")
+async def handle_login_button(ack, body, client):
+    """Handle login button click."""
+    try:
+        # Acknowledge the action
+        await ack()
+        
+        # Get the login URL
+        login_url = get_login_url()
+        
+        # Open the OAuth URL in a new window
+        await client.views_open(
+            trigger_id=body["trigger_id"],
+            view={
+                "type": "modal",
+                "title": {
+                    "type": "plain_text",
+                    "text": "Login to PDF Summarizer"
+                },
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "Click below to login with Slack:"
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {
+                                    "type": "plain_text",
+                                    "text": "Login with Slack"
+                                },
+                                "url": login_url
+                            }
+                        ]
+                    }
+                ]
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error handling login button: {str(e)}")
+        raise
+
+def get_monthly_usage(user_id: str, team_id: str) -> int:
+    """Get user's monthly usage count."""
+    current_month = datetime.now().strftime('%Y-%m')
+    Usage = Query()
+    return usage.count(
+        (Usage.user_id == user_id) & 
+        (Usage.team_id == team_id) &
+        (Usage.month == current_month)
+    )
 
 if __name__ == "__main__":
     import uvicorn
