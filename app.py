@@ -191,122 +191,141 @@ def generate_summary(text: str) -> str:
         raise
 
 @slack_app.event("app_mention")
-async def handle_mention(event, say, client):
+def handle_mention(event, say, client):
     """Handle app mention events."""
     logger.info("="*80)
     logger.info("📥 Received new app mention event")
     logger.info(f"👤 From user: {event.get('user')}")
     
     user_id = event['user']
+    temp_files = []  # Keep track of temporary files to clean up
     
-    # Check if user has exceeded limit
-    if not check_usage_limit(user_id):
-        logger.warning(f"⚠️ User {user_id} has exceeded their monthly limit")
-        await say(
-            thread_ts=event['ts'],
-            text=f"You've hit your monthly limit of {MONTHLY_LIMIT} summaries. Upgrade to Pro to continue: {UPGRADE_LINK}"
-        )
-        return
-    
-    # Check for file attachments
-    if 'files' not in event:
-        logger.warning("⚠️ No files attached in mention")
-        await say(
-            thread_ts=event['ts'],
-            text="Please upload a PDF file for summarization."
-        )
-        return
-    
-    # Process each PDF file
-    for file in event['files']:
-        logger.info(f"📄 Processing file: {file['name']}")
-        if file['filetype'] != 'pdf':
-            logger.warning(f"⚠️ Non-PDF file received: {file['filetype']}")
-            continue
-            
-        try:
-            # Download file
-            logger.info(f"🔍 Getting file info for: {file['id']}")
-            response = client.files_info(file=file['id'])
-            
-            if not response.get('ok'):
-                error_msg = f"❌ Slack API error: {response.get('error')}"
-                logger.error(error_msg)
-                raise Exception(error_msg)
+    try:
+        # Check if user has exceeded limit
+        if not check_usage_limit(user_id):
+            logger.warning(f"⚠️ User {user_id} has exceeded their monthly limit")
+            say(
+                thread_ts=event['ts'],
+                text=f"You've hit your monthly limit of {MONTHLY_LIMIT} summaries. Upgrade to Pro to continue: {UPGRADE_LINK}"
+            )
+            return
+        
+        # Check for file attachments
+        if 'files' not in event:
+            logger.warning("⚠️ No files attached in mention")
+            say(
+                thread_ts=event['ts'],
+                text="Please upload a PDF file for summarization."
+            )
+            return
+        
+        # Process each PDF file
+        for file in event['files']:
+            logger.info(f"📄 Processing file: {file['name']}")
+            if file['filetype'] != 'pdf':
+                logger.warning(f"⚠️ Non-PDF file received: {file['filetype']}")
+                continue
                 
-            file_url = response['file']['url_private_download']
-            logger.info(f"⬇️ Downloading file from: {file_url}")
-            
-            # Download the file
-            logger.info(f"⬇️ Downloading file from: {file_url}")
             try:
-                # Get file info first
-                file_info = client.files_info(file=file['id'])
-                if not file_info.get('ok'):
-                    raise Exception(f"Failed to get file info: {file_info.get('error')}")
+                # Download file
+                logger.info(f"🔍 Getting file info for: {file['id']}")
+                response = client.files_info(file=file['id'])
                 
-                # Download the file using the private URL
-                file_url = file_info['file']['url_private_download']
-                file_response = requests.get(
-                    file_url,
-                    headers={'Authorization': f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"}
+                if not response.get('ok'):
+                    error_msg = f"❌ Slack API error: {response.get('error')}"
+                    logger.error(error_msg)
+                    raise Exception(error_msg)
+                    
+                file_url = response['file']['url_private_download']
+                logger.info(f"⬇️ Downloading file from: {file_url}")
+                
+                # Download the file
+                logger.info(f"⬇️ Downloading file from: {file_url}")
+                try:
+                    # Get file info first
+                    file_info = client.files_info(file=file['id'])
+                    if not file_info.get('ok'):
+                        raise Exception(f"Failed to get file info: {file_info.get('error')}")
+                    
+                    # Download the file using the private URL
+                    file_url = file_info['file']['url_private_download']
+                    file_response = requests.get(
+                        file_url,
+                        headers={'Authorization': f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"}
+                    )
+                    
+                    if file_response.status_code != 200:
+                        raise Exception(f"Failed to download file: HTTP {file_response.status_code}")
+                    
+                    # Save the file temporarily
+                    temp_file_path = f"temp_{file['id']}.pdf"
+                    with open(temp_file_path, 'wb') as f:
+                        f.write(file_response.content)
+                    temp_files.append(temp_file_path)  # Add to cleanup list
+                    logger.info(f"✅ File downloaded successfully. Size: {len(file_response.content)} bytes")
+                except Exception as e:
+                    logger.error(f"❌ Error downloading file: {str(e)}")
+                    raise
+                
+                # Extract text and generate summary
+                logger.info("📝 Starting text extraction from PDF")
+                try:
+                    pdf_text = extract_text_from_pdf(file_response.content)
+                    logger.info(f"✅ Text extraction completed. Length: {len(pdf_text)} characters")
+                except Exception as e:
+                    logger.error(f"❌ Error extracting text from PDF: {str(e)}")
+                    raise
+                
+                # Generate summary
+                logger.info("🤖 Generating summary with OpenAI")
+                try:
+                    summary = generate_summary(pdf_text)
+                    logger.info(f"✅ Summary generated successfully. Length: {len(summary)} characters")
+                    logger.debug(f"Generated summary: {summary}")
+                except Exception as e:
+                    logger.error(f"❌ Error generating summary: {str(e)}")
+                    raise
+                
+                # Record usage
+                record_usage(user_id)
+                
+                # Send summary
+                logger.info("📤 Sending summary to Slack")
+                say(
+                    thread_ts=event['ts'],
+                    text=f"Here's the summary of {file['name']}:\n\n{summary}"
+                )
+                logger.info(f"✅ Successfully processed and summarized {file['name']}")
+                
+                # Send success message
+                say(
+                    thread_ts=event['ts'],
+                    text=f"✨ Successfully processed {file['name']}!"
                 )
                 
-                if file_response.status_code != 200:
-                    raise Exception(f"Failed to download file: HTTP {file_response.status_code}")
+            except Exception as e:
+                error_details = {
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "traceback": traceback.format_exc()
+                }
+                logger.error("❌ Error processing file:")
+                logger.error(json.dumps(error_details, indent=2))
                 
-                # Save the file temporarily
-                temp_file_path = f"temp_{file['id']}.pdf"
-                with open(temp_file_path, 'wb') as f:
-                    f.write(file_response.content)
-                logger.info(f"✅ File downloaded successfully. Size: {len(file_response.content)} bytes")
-            except Exception as e:
-                logger.error(f"❌ Error downloading file: {str(e)}")
-                raise
-            
-            # Extract text and generate summary
-            logger.info("📝 Starting text extraction from PDF")
+                say(
+                    thread_ts=event['ts'],
+                    text=f"Sorry, I encountered an error processing {file['name']}. Please try again."
+                )
+    
+    finally:
+        # Clean up temporary files
+        for temp_file in temp_files:
             try:
-                pdf_text = extract_text_from_pdf(file_response.content)
-                logger.info(f"✅ Text extraction completed. Length: {len(pdf_text)} characters")
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                    logger.info(f"🧹 Cleaned up temporary file: {temp_file}")
             except Exception as e:
-                logger.error(f"❌ Error extracting text from PDF: {str(e)}")
-                raise
-            
-            # Generate summary
-            logger.info("🤖 Generating summary with OpenAI")
-            try:
-                summary = generate_summary(pdf_text)
-                logger.info(f"✅ Summary generated successfully. Length: {len(summary)} characters")
-                logger.debug(f"Generated summary: {summary}")
-            except Exception as e:
-                logger.error(f"❌ Error generating summary: {str(e)}")
-                raise
-            
-            # Record usage
-            record_usage(user_id)
-            
-            # Send summary
-            logger.info("📤 Sending summary to Slack")
-            await say(
-                thread_ts=event['ts'],
-                text=f"Here's the summary of {file['name']}:\n\n{summary}"
-            )
-            logger.info(f"✅ Successfully processed and summarized {file['name']}")
-            
-        except Exception as e:
-            error_details = {
-                "error_type": type(e).__name__,
-                "error_message": str(e),
-                "traceback": traceback.format_exc()
-            }
-            logger.error("❌ Error processing file:")
-            logger.error(json.dumps(error_details, indent=2))
-            
-            await say(
-                thread_ts=event['ts'],
-                text=f"Sorry, I encountered an error processing {file['name']}. Please try again."
-            )
+                logger.error(f"❌ Error cleaning up temporary file {temp_file}: {str(e)}")
     
     logger.info("="*80)
 
@@ -344,106 +363,8 @@ async def endpoint(request: Request):
             logger.info(f"✅ Received challenge: {body_json['challenge']}")
             return {"challenge": body_json["challenge"]}
             
-        # Log event type
-        if "event" in body_json:
-            event_type = body_json['event'].get('type')
-            logger.info(f"📝 Received event type: {event_type}")
-            
-            # For app_mention events, we need to check if there are files
-            if event_type == "app_mention":
-                # Get the thread_ts if it exists
-                thread_ts = body_json['event'].get('thread_ts') or body_json['event'].get('ts')
-                
-                # Check if there are files in the event
-                if 'files' not in body_json['event']:
-                    logger.info("⚠️ No files in the event")
-                    return {"ok": True}
-                
-                # Process the files
-                for file in body_json['event']['files']:
-                    logger.info(f"📄 Processing file: {file.get('name')}")
-                    if file.get('filetype') != 'pdf':
-                        logger.info(f"⚠️ Non-PDF file received: {file.get('filetype')}")
-                        continue
-                    
-                    try:
-                        # Download file
-                        response = slack_app.client.files_info(file=file['id'])
-                        if not response.get('ok'):
-                            logger.error(f"❌ Slack API error: {response.get('error')}")
-                            raise Exception(f"Slack API error: {response.get('error')}")
-                            
-                        file_url = response['file']['url_private_download']
-                        logger.info(f"⬇️ Downloading file from: {file_url}")
-                        
-                        # Download the file
-                        logger.info(f"⬇️ Downloading file from: {file_url}")
-                        try:
-                            # Get file info first
-                            file_info = slack_app.client.files_info(file=file['id'])
-                            if not file_info.get('ok'):
-                                raise Exception(f"Failed to get file info: {file_info.get('error')}")
-                            
-                            # Download the file using the private URL
-                            file_url = file_info['file']['url_private_download']
-                            file_response = requests.get(
-                                file_url,
-                                headers={'Authorization': f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"}
-                            )
-                            
-                            if file_response.status_code != 200:
-                                raise Exception(f"Failed to download file: HTTP {file_response.status_code}")
-                            
-                            # Save the file temporarily
-                            temp_file_path = f"temp_{file['id']}.pdf"
-                            with open(temp_file_path, 'wb') as f:
-                                f.write(file_response.content)
-                            logger.info(f"✅ File downloaded successfully. Size: {len(file_response.content)} bytes")
-                        except Exception as e:
-                            logger.error(f"❌ Error downloading file: {str(e)}")
-                            raise
-                        
-                        # Extract text and generate summary
-                        logger.info("📝 Starting text extraction from PDF")
-                        try:
-                            pdf_text = extract_text_from_pdf(file_response.content)
-                            logger.info(f"✅ Text extraction completed. Length: {len(pdf_text)} characters")
-                        except Exception as e:
-                            logger.error(f"❌ Error extracting text from PDF: {str(e)}")
-                            raise
-                        
-                        logger.info("🤖 Generating summary")
-                        summary = generate_summary(pdf_text)
-                        logger.info(f"✅ Summary generated successfully. Length: {len(summary)} characters")
-                        
-                        # Record usage
-                        record_usage(body_json['event']['user'])
-                        
-                        # Send summary
-                        logger.info("📤 Sending summary to Slack")
-                        slack_app.client.chat_postMessage(
-                            channel=body_json['event']['channel'],
-                            thread_ts=thread_ts,
-                            text=f"Here's the summary of {file.get('name')}:\n\n{summary}"
-                        )
-                        logger.info(f"✅ Successfully processed and summarized {file.get('name')}")
-                        
-                    except Exception as e:
-                        error_details = {
-                            "error_type": type(e).__name__,
-                            "error_message": str(e),
-                            "traceback": traceback.format_exc()
-                        }
-                        logger.error("❌ Error processing file:")
-                        logger.error(json.dumps(error_details, indent=2))
-                        
-                        slack_app.client.chat_postMessage(
-                            channel=body_json['event']['channel'],
-                            thread_ts=thread_ts,
-                            text=f"Sorry, I encountered an error processing {file.get('name')}. Please try again."
-                        )
-            
-        return {"ok": True}
+        # Let the SlackRequestHandler process other events
+        return await handler.handle(request)
         
     except json.JSONDecodeError as e:
         logger.error(f"❌ Failed to parse request body: {e}")
