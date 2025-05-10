@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Set
 import fitz  # PyMuPDF
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import RedirectResponse
@@ -15,8 +15,19 @@ import json
 from pydantic import BaseModel
 import requests
 import traceback
+import hashlib
+from collections import deque
+from threading import Lock
 from slack_oauth import handle_slack_oauth, get_login_url, verify_token, create_jwt
 from slack_sdk.errors import SlackApiError
+from migrations import migrate_subscription_schema, initialize_trial_period
+from subscription_manager import (
+    get_subscription_limits,
+    check_usage_limit,
+    get_usage_stats,
+    handle_subscription_change,
+    check_subscription_expiry
+)
 
 # Configure logging with more detail and better formatting
 logging.basicConfig(
@@ -60,6 +71,11 @@ SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID")
 SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET")
 SLACK_REDIRECT_URI = os.getenv("SLACK_REDIRECT_URI")
 
+# Initialize message queue and processed events set
+processed_events: Set[str] = set()
+message_queue = deque(maxlen=1000)  # Keep last 1000 events
+queue_lock = Lock()
+
 class PDFRequest(BaseModel):
     pdf_url: str
 
@@ -98,9 +114,17 @@ def get_user_status(user_id: str, email: str = None, team_id: str = None) -> dic
             'email': email,
             'status': 'free',
             'created_at': datetime.now().isoformat(),
-            'last_login': datetime.now().isoformat()
+            'last_login': datetime.now().isoformat(),
+            'subscription_status': 'trial',
+            'subscription_tier': 'standard',
+            'trial_start_date': datetime.now().isoformat(),
+            'subscription_start_date': None,
+            'subscription_end_date': None,
+            'payment_provider': None,
+            'payment_customer_id': None
         }
         users.insert(user)
+        initialize_trial_period(user_id, team_id)
     elif email and user.get('email') != email:
         # Update email if it has changed
         users.update({
@@ -227,12 +251,15 @@ async def handle_mention(event, say, client):
     temp_files = []  # Keep track of temporary files to clean up
     
     try:
-        # Check if user has exceeded limit
+        # Check subscription and usage limits
         if not check_usage_limit(user_id, team_id):
-            logger.warning(f"⚠️ User {user_id} has exceeded their monthly limit")
+            usage_stats = get_usage_stats(user_id, team_id)
+            logger.warning(f"⚠️ User {user_id} has exceeded their limit")
             await say(
                 thread_ts=event['ts'],
-                text=f"You've hit your monthly limit of {MONTHLY_LIMIT} summaries. Upgrade to Pro to continue: {UPGRADE_LINK}"
+                text=f"You've hit your monthly limit of {usage_stats['limit']} summaries. "
+                     f"Current usage: {usage_stats['current_usage']}. "
+                     f"Upgrade your subscription to continue: {UPGRADE_LINK}"
             )
             return
         
@@ -247,96 +274,14 @@ async def handle_mention(event, say, client):
         
         # Process each PDF file
         for file in event['files']:
-            logger.info(f"📄 Processing file: {file['name']}")
-            if file['filetype'] != 'pdf':
-                logger.warning(f"⚠️ Non-PDF file received: {file['filetype']}")
-                continue
+            await process_pdf_file(file, user_id, team_id, event['ts'], say, client)
             
-            try:
-                # Download file
-                logger.info(f"🔍 Getting file info for: {file['id']}")
-                response = client.files_info(file=file['id'])
-                
-                if not response.get('ok'):
-                    error_msg = f"❌ Slack API error: {response.get('error')}"
-                    logger.error(error_msg)
-                    raise Exception(error_msg)
-                    
-                file_url = response['file']['url_private_download']
-                logger.info(f"⬇️ Downloading file from: {file_url}")
-                
-                # Download the file
-                logger.info(f"⬇️ Downloading file from: {file_url}")
-                try:
-                    # Get file info first
-                    file_info = client.files_info(file=file['id'])
-                    if not file_info.get('ok'):
-                        raise Exception(f"Failed to get file info: {file_info.get('error')}")
-                    
-                    # Download the file using the private URL
-                    file_url = file_info['file']['url_private_download']
-                    file_response = requests.get(
-                        file_url,
-                        headers={'Authorization': f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"}
-                    )
-                    
-                    if file_response.status_code != 200:
-                        raise Exception(f"Failed to download file: HTTP {file_response.status_code}")
-                    
-                    # Save the file temporarily
-                    temp_file_path = f"temp_{file['id']}.pdf"
-                    with open(temp_file_path, 'wb') as f:
-                        f.write(file_response.content)
-                    temp_files.append(temp_file_path)
-                    logger.info(f"✅ File downloaded successfully. Size: {len(file_response.content)} bytes")
-                except Exception as e:
-                    logger.error(f"❌ Error downloading file: {str(e)}")
-                    raise
-                
-                # Extract text and generate summary
-                logger.info("📝 Starting text extraction from PDF")
-                try:
-                    pdf_text = extract_text_from_pdf(file_response.content)
-                    logger.info(f"✅ Text extraction completed. Length: {len(pdf_text)} characters")
-                except Exception as e:
-                    logger.error(f"❌ Error extracting text from PDF: {str(e)}")
-                    raise
-                
-                # Generate summary
-                logger.info("🤖 Generating summary with OpenAI")
-                try:
-                    summary = generate_summary(pdf_text)
-                    logger.info(f"✅ Summary generated successfully. Length: {len(summary)} characters")
-                    logger.debug(f"Generated summary: {summary}")
-                except Exception as e:
-                    logger.error(f"❌ Error generating summary: {str(e)}")
-                    raise
-                
-                # Record usage
-                record_usage(user_id, team_id, file['name'])
-                
-                # Send summary
-                logger.info("📤 Sending summary to Slack")
-                await say(
-                    thread_ts=event['ts'],
-                    text=f"Here's the summary of {file['name']}:\n\n{summary}"
-                )
-                logger.info(f"✅ Successfully processed and summarized {file['name']}")
-                
-            except Exception as e:
-                error_details = {
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                    "traceback": traceback.format_exc()
-                }
-                logger.error("❌ Error processing file:")
-                logger.error(json.dumps(error_details, indent=2))
-                
-                await say(
-                    thread_ts=event['ts'],
-                    text=f"Sorry, I encountered an error processing {file['name']}. Please try again."
-                )
-    
+    except Exception as e:
+        logger.error(f"Error in handle_mention: {str(e)}")
+        await say(
+            thread_ts=event['ts'],
+            text="Sorry, I encountered an error processing your request. Please try again."
+        )
     finally:
         # Clean up temporary files
         for temp_file in temp_files:
@@ -346,22 +291,23 @@ async def handle_mention(event, say, client):
                     logger.info(f"🧹 Cleaned up temporary file: {temp_file}")
             except Exception as e:
                 logger.error(f"❌ Error cleaning up temporary file {temp_file}: {str(e)}")
-    
-    logger.info("="*80)
 
-@slack_app.command("/reset_limits")
-async def reset_limits(ack, command, say):
-    """Reset monthly usage limits (admin only)."""
-    # Check if user is admin (you should implement proper admin check)
-    if command['user_id'] not in ['ADMIN_USER_ID']:  # Replace with actual admin check
-        await say("This command is only available to administrators.")
-        return
-    
-    usage.truncate()
-    await say("Usage limits have been reset for all users.")
+def get_event_hash(event: dict) -> str:
+    """Generate a unique hash for an event."""
+    event_str = json.dumps(event, sort_keys=True)
+    return hashlib.md5(event_str.encode()).hexdigest()
 
-# Create FastAPI handler
-handler = SlackRequestHandler(slack_app)
+def is_event_processed(event_hash: str) -> bool:
+    """Check if an event has been processed."""
+    with queue_lock:
+        return event_hash in processed_events
+
+def mark_event_processed(event_hash: str):
+    """Mark an event as processed."""
+    with queue_lock:
+        processed_events.add(event_hash)
+        if len(processed_events) > 1000:  # Prevent unbounded growth
+            processed_events.clear()
 
 @app.post("/slack/events")
 async def endpoint(request: Request):
@@ -383,6 +329,12 @@ async def endpoint(request: Request):
             logger.info(f"✅ Received challenge: {body_json['challenge']}")
             return {"challenge": body_json["challenge"]}
             
+        # Check if event has been processed
+        event_hash = get_event_hash(body_json)
+        if is_event_processed(event_hash):
+            logger.info("⚠️ Event already processed, skipping")
+            return {"ok": True}
+            
         # Log event type
         if "event" in body_json:
             event_type = body_json['event'].get('type')
@@ -400,87 +352,17 @@ async def endpoint(request: Request):
                 
                 # Process the files
                 for file in body_json['event']['files']:
-                    logger.info(f"📄 Processing file: {file.get('name')}")
-                    if file.get('filetype') != 'pdf':
-                        logger.info(f"⚠️ Non-PDF file received: {file.get('filetype')}")
-                        continue
-                    
-                    try:
-                        # Download file
-                        response = slack_app.client.files_info(file=file['id'])
-                        if not response.get('ok'):
-                            logger.error(f"❌ Slack API error: {response.get('error')}")
-                            raise Exception(f"Slack API error: {response.get('error')}")
-                            
-                        file_url = response['file']['url_private_download']
-                        logger.info(f"⬇️ Downloading file from: {file_url}")
-                        
-                        # Download the file
-                        logger.info(f"⬇️ Downloading file from: {file_url}")
-                        try:
-                            # Get file info first
-                            file_info = slack_app.client.files_info(file=file['id'])
-                            if not file_info.get('ok'):
-                                raise Exception(f"Failed to get file info: {file_info.get('error')}")
-                            
-                            # Download the file using the private URL
-                            file_url = file_info['file']['url_private_download']
-                            file_response = requests.get(
-                                file_url,
-                                headers={'Authorization': f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"}
-                            )
-                            
-                            if file_response.status_code != 200:
-                                raise Exception(f"Failed to download file: HTTP {file_response.status_code}")
-                            
-                            # Save the file temporarily
-                            temp_file_path = f"temp_{file['id']}.pdf"
-                            with open(temp_file_path, 'wb') as f:
-                                f.write(file_response.content)
-                            logger.info(f"✅ File downloaded successfully. Size: {len(file_response.content)} bytes")
-                        except Exception as e:
-                            logger.error(f"❌ Error downloading file: {str(e)}")
-                            raise
-                        
-                        # Extract text and generate summary
-                        logger.info("📝 Starting text extraction from PDF")
-                        try:
-                            pdf_text = extract_text_from_pdf(file_response.content)
-                            logger.info(f"✅ Text extraction completed. Length: {len(pdf_text)} characters")
-                        except Exception as e:
-                            logger.error(f"❌ Error extracting text from PDF: {str(e)}")
-                            raise
-                        
-                        logger.info("🤖 Generating summary")
-                        summary = generate_summary(pdf_text)
-                        logger.info(f"✅ Summary generated successfully. Length: {len(summary)} characters")
-                        
-                        # Record usage
-                        record_usage(body_json['event']['user'], body_json['event']['team'], file.get('name'))
-                        
-                        # Send summary
-                        logger.info("📤 Sending summary to Slack")
-                        slack_app.client.chat_postMessage(
-                            channel=body_json['event']['channel'],
-                            thread_ts=thread_ts,
-                            text=f"Here's the summary of {file.get('name')}:\n\n{summary}"
-                        )
-                        logger.info(f"✅ Successfully processed and summarized {file.get('name')}")
-                        
-                    except Exception as e:
-                        error_details = {
-                            "error_type": type(e).__name__,
-                            "error_message": str(e),
-                            "traceback": traceback.format_exc()
-                        }
-                        logger.error("❌ Error processing file:")
-                        logger.error(json.dumps(error_details, indent=2))
-                        
-                        slack_app.client.chat_postMessage(
-                            channel=body_json['event']['channel'],
-                            thread_ts=thread_ts,
-                            text=f"Sorry, I encountered an error processing {file.get('name')}. Please try again."
-                        )
+                    await process_pdf_file(
+                        file,
+                        body_json['event']['user'],
+                        body_json['event'].get('team', body_json.get('team_id')),
+                        thread_ts,
+                        slack_app.client.chat_postMessage,
+                        slack_app.client
+                    )
+                
+                # Mark event as processed
+                mark_event_processed(event_hash)
             
         return {"ok": True}
         
@@ -492,6 +374,145 @@ async def endpoint(request: Request):
         raise HTTPException(status_code=500, detail="Internal server error")
     
     logger.info("="*80)
+
+async def process_pdf_file(file, user_id, team_id, thread_ts, say, client):
+    """Process a single PDF file and generate summary."""
+    logger.info(f"📄 Processing file: {file['name']}")
+    if file['filetype'] != 'pdf':
+        logger.warning(f"⚠️ Non-PDF file received: {file['filetype']}")
+        return
+    
+    try:
+        # Download file
+        logger.info(f"🔍 Getting file info for: {file['id']}")
+        response = client.files_info(file=file['id'])
+        
+        if not response.get('ok'):
+            error_msg = f"❌ Slack API error: {response.get('error')}"
+            logger.error(error_msg)
+            raise Exception(error_msg)
+            
+        file_url = response['file']['url_private_download']
+        logger.info(f"⬇️ Downloading file from: {file_url}")
+        
+        # Download the file
+        file_response = requests.get(
+            file_url,
+            headers={'Authorization': f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"}
+        )
+        
+        if file_response.status_code != 200:
+            raise Exception(f"Failed to download file: HTTP {file_response.status_code}")
+        
+        # Extract text and generate summary
+        logger.info("📝 Starting text extraction from PDF")
+        pdf_text = extract_text_from_pdf(file_response.content)
+        logger.info(f"✅ Text extraction completed. Length: {len(pdf_text)} characters")
+        
+        # Check text length and chunk if necessary
+        if len(pdf_text) > 4000:  # Approximate token limit
+            logger.warning("⚠️ PDF text too long, chunking...")
+            chunks = [pdf_text[i:i+4000] for i in range(0, len(pdf_text), 4000)]
+            summaries = []
+            for i, chunk in enumerate(chunks):
+                logger.info(f"Processing chunk {i+1}/{len(chunks)}")
+                chunk_summary = generate_summary(chunk)
+                summaries.append(chunk_summary)
+            summary = "\n\n".join(summaries)
+        else:
+            # Generate summary
+            logger.info("🤖 Generating summary with OpenAI")
+            summary = generate_summary(pdf_text)
+        
+        logger.info(f"✅ Summary generated successfully. Length: {len(summary)} characters")
+        
+        # Record usage for subscription tracking
+        try:
+            record_usage(user_id, team_id, file['name'])
+        except Exception as e:
+            logger.error(f"Error recording usage: {str(e)}")
+        
+        # Get the channel from the file or use the user's DM channel
+        channel = file.get('channels', [None])[0] or file.get('groups', [None])[0] or file.get('ims', [None])[0]
+        if not channel:
+            # If no channel found, try to open a DM with the user
+            try:
+                dm_response = client.conversations_open(users=[user_id])
+                if dm_response.get('ok'):
+                    channel = dm_response['channel']['id']
+                else:
+                    raise Exception("Could not open DM channel")
+            except Exception as e:
+                logger.error(f"Failed to get channel: {str(e)}")
+                raise Exception("Could not determine where to send the message")
+        
+        # Send summary
+        logger.info(f"📤 Sending summary to Slack channel: {channel}")
+        try:
+            await say(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f"Here's the summary of {file['name']}:\n\n{summary}"
+            )
+            logger.info(f"✅ Successfully processed and summarized {file['name']}")
+        except Exception as e:
+            logger.error(f"Failed to send message to channel {channel}: {str(e)}")
+            # Try sending to user's DM as fallback
+            try:
+                dm_response = client.conversations_open(users=[user_id])
+                if dm_response.get('ok'):
+                    fallback_channel = dm_response['channel']['id']
+                    await say(
+                        channel=fallback_channel,
+                        text=f"I couldn't send the summary to the original channel. Here's the summary of {file['name']}:\n\n{summary}"
+                    )
+                    logger.info(f"✅ Sent summary to fallback DM channel")
+                else:
+                    raise Exception("Could not open DM channel")
+            except Exception as dm_error:
+                logger.error(f"Failed to send to fallback channel: {str(dm_error)}")
+                raise Exception("Could not send the summary to any channel")
+        
+    except Exception as e:
+        error_details = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": traceback.format_exc()
+        }
+        logger.error("❌ Error processing file:")
+        logger.error(json.dumps(error_details, indent=2))
+        
+        # Try to send error message to user's DM
+        try:
+            dm_response = client.conversations_open(users=[user_id])
+            if dm_response.get('ok'):
+                error_channel = dm_response['channel']['id']
+                await say(
+                    channel=error_channel,
+                    text=f"Sorry, I encountered an error processing {file['name']}. Please try again."
+                )
+                logger.info("✅ Sent error message to user's DM")
+            else:
+                logger.error("Could not send error message to user's DM")
+        except Exception as dm_error:
+            logger.error(f"Failed to send error message: {str(dm_error)}")
+        
+        # Re-raise the original exception for the main error handler
+        raise
+
+@slack_app.command("/reset_limits")
+async def reset_limits(ack, command, say):
+    """Reset monthly usage limits (admin only)."""
+    # Check if user is admin (you should implement proper admin check)
+    if command['user_id'] not in ['ADMIN_USER_ID']:  # Replace with actual admin check
+        await say("This command is only available to administrators.")
+        return
+    
+    usage.truncate()
+    await say("Usage limits have been reset for all users.")
+
+# Create FastAPI handler
+handler = SlackRequestHandler(slack_app)
 
 @app.get("/login")
 async def login():
@@ -606,79 +627,51 @@ async def handle_app_home_opened(event, say, client):
         user_id = event["user"]
         team_id = event["team_id"]
         
-        # Get user status
+        # Get user status and subscription info
         user = get_user_status(user_id, team_id=team_id)
+        usage_stats = get_usage_stats(user_id, team_id)
         
-        # Check if user is authenticated
-        if user.get('email'):
-            # Show authenticated view
-            await client.views_publish(
-                user_id=user_id,
-                view={
-                    "type": "home",
-                    "blocks": [
-                        {
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": f"Welcome back, <@{user_id}>!"
-                            }
-                        },
-                        {
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": f"Your usage this month: {get_monthly_usage(user_id, team_id)}/10"
-                            }
-                        },
-                        {
-                            "type": "actions",
-                            "elements": [
-                                {
-                                    "type": "button",
-                                    "text": {
-                                        "type": "plain_text",
-                                        "text": "Upgrade to Pro"
-                                    },
-                                    "action_id": "upgrade_button"
-                                }
-                            ]
+        # Check for subscription expiry
+        expiry_info = check_subscription_expiry(user_id, team_id)
+        
+        # Show authenticated view
+        await client.views_publish(
+            user_id=user_id,
+            view={
+                "type": "home",
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"Welcome back, <@{user_id}>!"
                         }
-                    ]
-                }
-            )
-        else:
-            # Show unauthenticated view
-            await client.views_publish(
-                user_id=user_id,
-                view={
-                    "type": "home",
-                    "blocks": [
-                        {
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": "Welcome to PDF Summarizer!"
-                            }
-                        },
-                        {
-                            "type": "actions",
-                            "elements": [
-                                {
-                                    "type": "button",
-                                    "text": {
-                                        "type": "plain_text",
-                                        "text": "Login with Slack"
-                                    },
-                                    "action_id": "login_button"
-                                }
-                            ]
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"*Subscription Status:* {usage_stats['status'].title()}\n"
+                                f"*Current Tier:* {usage_stats['tier'].title()}\n"
+                                f"*Usage:* {usage_stats['current_usage']}/{usage_stats['limit']} summaries this month"
+                            )
                         }
-                    ]
-                }
+                    }
+                ]
+            }
+        )
+        
+        # Add expiry warning if needed
+        if expiry_info:
+            await client.chat_postMessage(
+                channel=user_id,
+                text=f"⚠️ Your {expiry_info['tier']} subscription will expire in {expiry_info['days_remaining']} days. "
+                     f"Renew now to maintain your benefits: {UPGRADE_LINK}"
             )
+            
     except Exception as e:
-        logger.error(f"Error handling app home opened: {str(e)}")
+        logger.error(f"Error in app home opened: {str(e)}")
         raise
 
 @slack_app.action("login_button")
@@ -737,6 +730,41 @@ def get_monthly_usage(user_id: str, team_id: str) -> int:
         (Usage.team_id == team_id) &
         (Usage.month == current_month)
     )
+
+# Add new subscription endpoints
+@app.post("/subscription/upgrade")
+async def upgrade_subscription(
+    tier: str,
+    user: dict = Depends(get_current_user)
+):
+    """Handle subscription upgrade."""
+    try:
+        if tier not in ['standard', 'premium']:
+            raise HTTPException(status_code=400, detail="Invalid subscription tier")
+            
+        success = handle_subscription_change(
+            user['slack_id'],
+            user['team_id'],
+            tier
+        )
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to update subscription")
+            
+        return {"status": "success", "message": f"Upgraded to {tier} tier"}
+    except Exception as e:
+        logger.error(f"Error upgrading subscription: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/subscription/status")
+async def get_subscription_status(user: dict = Depends(get_current_user)):
+    """Get current subscription status."""
+    try:
+        stats = get_usage_stats(user['slack_id'], user['team_id'])
+        return stats
+    except Exception as e:
+        logger.error(f"Error getting subscription status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

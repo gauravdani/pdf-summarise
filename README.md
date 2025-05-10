@@ -1,676 +1,403 @@
 # PDF Summarizer Slack Bot
 
-A Slack bot that summarizes PDF files using OpenAI's GPT-4 API. Users can upload PDFs and get AI-generated summaries directly in Slack.
+A Slack bot that summarizes PDF files using OpenAI's GPT-4 API. The bot provides both free and pro user tiers with different usage limits.
 
 ## Features
 
 - PDF text extraction and summarization
-- Usage tracking with monthly limits
-- Free vs Pro user tiers
-- Admin controls for user management
-- In-memory PDF processing (no disk storage)
-- Secure authentication via Slack OAuth
-- User dashboard
+- Slack integration with app home view
+- User authentication via Slack OAuth
+- Usage tracking and limits
+- Pro user upgrade option
+- Multi-workspace support
 
-## User Flow
+## User Workflows
 
-1. User uploads a PDF in a Slack channel
-2. User mentions the bot (e.g. "@pdf-summarizer-last-mile please summarize this")
-3. Bot processes the PDF and generates a summary
-4. Summary is posted as a reply in the thread
+### 1. Authentication Flow
+- **Initial Login**:
+  - User visits `/login` endpoint or clicks app home login button
+  - Redirected to Slack OAuth page
+  - User authorizes the app
+  - Redirected back to `/slack/oauth/callback`
+  - JWT token created and stored in secure cookie
+  - User redirected to dashboard
 
-## Authentication & User Management
+- **Session Management**:
+  - JWT tokens valid for 24 hours
+  - Secure, HTTP-only cookies
+  - Automatic token refresh on dashboard access
+  - Session invalidation on logout
 
-### Login Workflows
+### 2. PDF Processing Flow
+- **Basic Usage**:
+  1. User uploads PDF to Slack channel
+  2. User mentions bot: "@PDF Summarizer"
+  3. Bot processes PDF and generates summary
+  4. Summary posted as reply in thread
 
-#### 1. Slack OAuth Flow
-1. **Initial Login**
-   - User visits `/login` endpoint
-   - Redirected to Slack OAuth page
-   - User authorizes the app
-   - Redirected back to `/slack/oauth/callback`
-   - JWT token created and stored in secure cookie
-   - User redirected to dashboard
+- **Usage Limits**:
+  - Free users: 10 summaries per month
+  - Pro users: Unlimited summaries
+  - Usage tracked per user and workspace
+  - Monthly reset of usage counters
 
-2. **Session Management**
-   - JWT tokens valid for 24 hours
-   - Secure, HTTP-only cookies
-   - Automatic token refresh on dashboard access
-   - Session invalidation on logout
+### 3. App Home Interaction
+- **Unauthenticated View**:
+  - Welcome message
+  - Login button
+  - Basic app information
 
-3. **User Data Storage**
-   - Slack User ID
-   - Slack Workspace (Team) ID
-   - User Email
-   - Account Status (free/pro)
-   - Creation Date
-   - Last Login Timestamp
+- **Authenticated View**:
+  - Personalized welcome
+  - Current usage statistics
+  - Upgrade option for free users
+  - Quick access to recent summaries
 
-#### 2. User Identification
-- **Primary Keys**:
-  - `user_id`: Slack User ID
-  - `team_id`: Slack Workspace ID
-  - `email`: User's Email Address
+### 4. User Management
+- **User Data**:
+  - Slack User ID
+  - Workspace (Team) ID
+  - Email address
+  - Account status (free/pro)
+  - Creation date
+  - Last login timestamp
 
-- **User Status**:
-  - `free`: Limited to 10 summaries/month
-  - `pro`: Unlimited summaries
-  - `admin`: Full access to admin features
+- **Workspace Management**:
+  - Multi-workspace support
+  - Workspace-specific usage limits
+  - Team-level statistics
+  - Admin controls per workspace
 
-#### 3. Usage Tracking
-- **Per User**:
-  - Monthly summary count
-  - File names processed
-  - Timestamps of usage
-  - Status at time of usage
+## Prerequisites
 
-- **Per Workspace**:
-  - Total workspace usage
-  - Active users count
-  - Pro vs Free user ratio
-
-### Required Slack Scopes
-```yaml
-Bot Token Scopes:
-  - app_mentions:read
-  - channels:history
-  - chat:write
-  - files:read
-  - users:read
-  - users:read.email
-  - im:write
-  - im:read
-
-User Token Scopes:
-  - identity.basic
-  - identity.email
-  - identity.avatar
-```
-
-### Environment Variables
-```env
-# Slack Bot Configuration
-SLACK_BOT_TOKEN=xoxb-your-token
-SLACK_SIGNING_SECRET=your-signing-secret
-
-# Slack OAuth Configuration
-SLACK_CLIENT_ID=your-client-id
-SLACK_CLIENT_SECRET=your-client-secret
-SLACK_REDIRECT_URI=http://localhost:8000/slack/oauth/callback
-
-# JWT Configuration
-JWT_SECRET=your-jwt-secret
-
-# OpenAI Configuration
-OPENAI_API_KEY=your-openai-api-key
-```
-
-### Security Measures
-1. **Authentication**:
-   - JWT-based authentication
-   - Secure, HTTP-only cookies
-   - CSRF protection
-   - Rate limiting on auth endpoints
-
-2. **Data Protection**:
-   - Encrypted JWT tokens
-   - Secure cookie settings
-   - HTTPS enforcement
-   - Input validation
-
-3. **Access Control**:
-   - Role-based access (free/pro/admin)
-   - Workspace-level permissions
-   - Usage limits enforcement
-   - Admin-only routes protection
-
-### Testing Authentication
-1. **Local Testing**:
-   ```bash
-   # Start the application
-   uvicorn app:app --reload
-   
-   # Visit login page
-   open http://localhost:8000/login
-   ```
-
-2. **Production Testing**:
-   ```bash
-   # Start ngrok for public URL
-   ngrok http 8000
-   
-   # Update SLACK_REDIRECT_URI in .env
-   SLACK_REDIRECT_URI=https://your-ngrok-url/slack/oauth/callback
-   ```
-
-3. **Test Cases**:
-   - Login with new user
-   - Login with existing user
-   - Token expiration
-   - Invalid token handling
-   - Workspace switching
-   - Admin access verification
-
-### Common Issues & Solutions
-1. **OAuth Errors**:
-   - Check redirect URI matches exactly
-   - Verify all required scopes are added
-   - Ensure environment variables are set
-   - Check Slack app configuration
-
-2. **Token Issues**:
-   - Verify JWT_SECRET is set
-   - Check token expiration
-   - Ensure secure cookie settings
-   - Validate token format
-
-3. **Workspace Issues**:
-   - Verify team_id is being passed
-   - Check workspace permissions
-   - Validate workspace status
-   - Ensure proper error handling
-
-## Usage Limits
-
-- Free users: 10 summaries per month
-- Pro users: Unlimited summaries
-- Usage is tracked per user (Slack user_id)
-
-## Tech Stack
-
-- Python
-- FastAPI
-- Slack Bolt SDK
-- OpenAI GPT-4 API
-- PyMuPDF for PDF parsing
-- TinyDB for usage tracking
-- A virtual environment managed using the command python -m venv .venv
-- brew install ngrok, we need ngrok
-- ngrok config add-authtoken $YOUR_AUTHTOKEN
+- Python 3.8+
+- Slack workspace with admin access
+- OpenAI API key
+- ngrok (for local development)
 
 ## Setup
 
-1. Clone the repository
-2. Install dependencies:
+1. Clone the repository:
    ```bash
-   pip install -r requirements.txt
+   git clone https://github.com/yourusername/pdf-summarizer.git
+   cd pdf-summarizer
    ```
-3. Create a `.env` file with the following variables:
-   ```
-   SLACK_BOT_TOKEN=xoxb-your-token
-   SLACK_SIGNING_SECRET=your-signing-secret
-   OPENAI_API_KEY=your-openai-api-key
-   SLACK_CLIENT_ID=your-client-id
-   SLACK_CLIENT_SECRET=your-client-secret
-   SLACK_REDIRECT_URI=https://your-domain/slack/oauth/callback
-   JWT_SECRET=your-jwt-secret
-   ```
-4. Run the application:
+
+2. Create and activate virtual environment:
    ```bash
-   uvicorn app:app --reload
+   python -m venv .venv
+   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
    ```
 
-## Testing
-
-### Automated Tests
-
-1. Install testing dependencies:
+3. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
 
-2. Run the test suite:
-   ```bash
-   pytest tests/ --cov=app --cov-report=term-missing
+4. Set up environment variables in `.env`:
+   ```
+   # Slack Configuration
+   SLACK_CLIENT_ID=your_client_id_here
+   SLACK_CLIENT_SECRET=your_client_secret_here
+   SLACK_REDIRECT_URI=https://your-domain.com/slack/oauth/callback
+   SLACK_BOT_TOKEN=xoxb-your-bot-token-here
+   SLACK_SIGNING_SECRET=your_signing_secret_here
+
+   # JWT Configuration
+   JWT_SECRET=your_jwt_secret_here
+
+   # OpenAI Configuration
+   OPENAI_API_KEY=your_openai_api_key_here
+
+   # Feature Flags
+   ENABLE_SUBSCRIPTION_SYSTEM=false
+   ENABLE_TRIAL_PERIOD=false
+   ENABLE_USAGE_TRACKING=false
+   ENABLE_SUBSCRIPTION_LIMITS=false
+   ENABLE_SUBSCRIPTION_UPGRADE=false
    ```
 
-The test suite includes:
-- Unit tests for core functions
-- Integration tests for Slack events
-- Mock fixtures for external services
-- Database testing
-- API endpoint testing
+## Slack App Configuration
 
-### Manual Testing
+1. Go to https://api.slack.com/apps
+2. Create a new app or select your existing app
+3. Under "OAuth & Permissions", add the following scopes:
+   - Bot Token Scopes:
+     - `chat:write`
+     - `im:write`
+     - `im:read`
+     - `users:read`
+     - `users:read.email`
+     - `files:read`
+     - `app_mentions:read`
+   - User Token Scopes:
+     - `identity.basic`
+     - `identity.email`
+     - `identity.avatar`
+4. Set the Redirect URL to your callback URL
+5. Install the app to your workspace
+6. Copy the Bot User OAuth Token and Signing Secret to your `.env` file
 
-1. **Local Development Setup**
+## Running the Application
+
+1. Start ngrok for local development:
    ```bash
-   # Start the FastAPI server
+   ngrok http 8000
+   ```
+
+2. Update your Slack app's Redirect URL with the new ngrok URL
+
+3. Start the application:
+   ```bash
    uvicorn app:app --reload
    ```
 
-2. **Install and Configure Ngrok**
-   - Sign up at https://ngrok.com/
-   - Install ngrok:
-     ```bash
-     brew install ngrok
-     ```
-   - Get your authtoken from https://dashboard.ngrok.com/get-started/your-authtoken
-   - Configure ngrok:
-     ```bash
-     ngrok config add-authtoken YOUR_AUTH_TOKEN
-     ```
-   - Start ngrok in a new terminal:
-     ```bash
-     ngrok http 8000
-     ```
+## Testing the Application
 
-3. **Configure Slack App**
-   - Go to https://api.slack.com/apps
-   - Select your app
-   - Under "Event Subscriptions":
-     - Enable events
-     - Set Request URL to your ngrok URL + `/slack/events`
-     - Subscribe to bot events: `app_mention`
-   - Under "Slash Commands":
-     - Add `/reset_limits` command
-   - Under "OAuth & Permissions":
-     - Add bot scopes:
-       - `files:read`
-       - `chat:write`
-       - `commands`
-       - `identity.basic`
-       - `identity.email`
-       - `identity.avatar`
+### 1. Testing Login Flow
 
-4. **Test Scenarios**
+1. **Direct Login**:
+   - Visit `http://localhost:8000/login`
+   - You should be redirected to Slack OAuth
+   - After authorizing, you'll be redirected back to the dashboard
 
-   a. Basic PDF Summarization:
-   - Upload a PDF to a Slack channel
-   - Mention the bot: "@pdf-summarizer-last-mile please summarize this"
-   - Verify the summary appears in the thread
+2. **App Home Login**:
+   - Open your Slack workspace
+   - Click on the PDF Summarizer app
+   - Click the "Login with Slack" button
+   - Complete the OAuth flow
+   - Verify the app home updates with your usage stats
 
-   b. Usage Limits:
-   - Make multiple summary requests
-   - Verify the limit message appears after 10 requests
-   - Test with a pro user account
+3. **Session Management**:
+   - After logging in, check that the JWT token is set in cookies
+   - Visit `/dashboard` to verify authentication
+   - Try accessing `/dashboard` without the token to verify protection
 
-   c. Error Handling:
-   - Upload a non-PDF file
-   - Upload a corrupted PDF
-   - Test with missing file attachments
+### 2. Testing PDF Summarization
 
-   d. Admin Commands:
-   - Try `/reset_limits` as non-admin
-   - Try `/reset_limits` as admin
-   - Verify usage limits are reset
+1. **Basic Usage**:
+   - Upload a PDF file to a Slack channel
+   - Mention the bot: `@PDF Summarizer`
+   - Verify the summary is generated and posted
 
-   e. Authentication Flow:
-   - Test login with valid Slack credentials
-   - Test login with invalid credentials
-   - Test session expiration
-   - Test protected route access
-   - Test logout functionality
+2. **Usage Limits**:
+   - Test with a free user (10 summaries per month)
+   - Verify the limit message appears after exceeding quota
+   - Test with a pro user (unlimited summaries)
 
-5. **API Testing**
-   Visit these endpoints in your browser:
-   - `http://localhost:8000/` - Health check
-   - `http://localhost:8000/health` - Detailed health check
-   - `http://localhost:8000/docs` - API documentation
-   - `http://localhost:8000/redoc` - Alternative API docs
-   - `http://localhost:8000/login` - Login page
-   - `http://localhost:8000/dashboard` - Protected dashboard
+3. **Error Handling**:
+   - Test with non-PDF files
+   - Test with empty PDFs
+   - Test with corrupted PDFs
+   - Verify appropriate error messages
 
-6. **Monitoring**
-   - Check ngrok web interface: `http://127.0.0.1:4040`
-   - Monitor FastAPI logs
-   - Check Slack app logs in the Slack API dashboard
+### 3. Testing App Home Features
 
-### Test Data
+1. **View Updates**:
+   - Open app home as unauthenticated user
+   - Verify login button is visible
+   - Login and verify usage stats appear
+   - Check upgrade button functionality
 
-Sample PDFs for testing:
-- Small text document (1-2 pages)
-- Large document (10+ pages)
-- Document with images
-- Document with tables
-- Document with special characters
+2. **Usage Statistics**:
+   - Generate some summaries
+   - Verify usage count updates in app home
+   - Check monthly reset functionality
 
-#### Recommended Test File
-For consistent testing, you can use this OpenAI guide:
-- URL: https://cdn.openai.com/business-guides-and-resources/a-practical-guide-to-building-agents.pdf
-- Type: Technical document
-- Pages: Multiple
-- Content: Text, diagrams, and technical content
-- Good for testing: Text extraction, formatting preservation, and summary quality
+## API Endpoints
 
-To test with this file:
-1. Download the PDF from the URL
-2. Upload it to your Slack channel
-3. Mention the bot: "@pdf-summarizer-last-mile please summarize this"
-4. Verify the summary includes key points about building agents
+- `GET /`: Health check
+- `GET /health`: Detailed health check
+- `GET /login`: OAuth login redirect
+- `GET /slack/oauth/callback`: OAuth callback handler
+- `GET /dashboard`: Protected user dashboard
+- `POST /process-pdf`: Process PDF from URL
+- `POST /slack/events`: Slack events handler
 
-## Admin Commands
+## Security Features
 
-- `/reset_limits`: Reset monthly usage limits (admin only)
-
-## Monetization
-
-- Free tier: 10 summaries per month
-- Pro tier: Unlimited summaries
-- Upgrade link: https://yoursite.com/upgrade
-
-## Security
-
-- PDFs are processed in-memory only
-- No files are stored on disk
-- Secure API key handling
-- Admin-only commands for user management
 - JWT-based authentication
-- OAuth token encryption
-- HTTP-only cookies
-- CSRF protection
+- Secure cookie handling
+- HTTPS enforcement
+- Rate limiting
+- Input validation
+- Error handling
 
-## Development
+## Database Schema
 
-The bot uses FastAPI for webhook endpoints and Slack Bolt for Slack interactions. PDF processing is done in-memory using PyMuPDF, and user data is stored in a TinyDB database.
+### Users Table
+- `user_id`: Slack user ID
+- `team_id`: Slack workspace ID
+- `email`: User's email
+- `status`: User tier (free/pro)
+- `created_at`: Account creation timestamp
+- `last_login`: Last login timestamp
+
+### Usage Table
+- `user_id`: Slack user ID
+- `team_id`: Slack workspace ID
+- `email`: User's email
+- `month`: Usage month (YYYY-MM)
+- `timestamp`: Usage timestamp
+- `file_name`: Processed file name
+- `user_status`: User tier at time of use
+
+## Subscription Management
+
+### Subscription Tiers
+
+1. **Trial Tier**
+   - 7-day unlimited access
+   - All premium features
+   - Automatic conversion to free tier after trial
+   - Price: Free
+
+2. **Standard Tier**
+   - 100 summaries per month
+   - Priority processing
+   - Email support
+   - Price: €5.99/month
+
+3. **Premium Tier**
+   - 1000 summaries per month
+   - Priority processing
+   - Priority support
+   - Advanced analytics
+   - Price: €8.99/month
+
+### Subscription States
+
+1. **Trial State**
+   - Automatically assigned to new users
+   - Tracks trial start date
+   - Sends reminder emails at 5 days and 1 day before expiry
+   - Converts to free tier after 7 days if no subscription chosen
+
+2. **Active Subscription**
+   - Monthly recurring billing
+   - Usage tracking against monthly limit
+   - Automatic renewal
+   - Grace period for failed payments
+
+3. **Expired/Cancelled**
+   - Access to free tier features
+   - Usage limited to 10 summaries per month
+   - Option to resubscribe
+   - Data retention for 30 days
+
+### Implementation Details
+
+1. **Database Updates**
+   ```sql
+   -- Add to Users Table
+   subscription_status: ENUM('trial', 'active', 'expired')
+   subscription_tier: ENUM('standard', 'premium')
+   trial_start_date: DATETIME
+   subscription_start_date: DATETIME
+   subscription_end_date: DATETIME
+   payment_provider: STRING
+   payment_customer_id: STRING
+   ```
+
+2. **Payment Integration**
+   - Stripe integration for recurring payments
+   - Webhook handling for payment events
+   - Automatic invoice generation
+   - Failed payment handling
+
+3. **Subscription Flow**
+   ```
+   New User → Trial (7 days) → Choose Plan → Subscription Active
+                                    ↓
+                              Free Tier (10/month)
+   ```
+
+4. **Usage Tracking**
+   - Track usage against subscription limits
+   - Reset counters monthly
+   - Pro-rate usage for mid-month upgrades
+   - Usage alerts at 80% and 100% of limit
+
+5. **Notification System**
+   - Trial expiration reminders
+   - Usage limit alerts
+   - Payment failure notifications
+   - Subscription renewal reminders
+
+### Upgrade/Downgrade Process
+
+1. **Upgrading**
+   - Immediate access to new tier
+   - Pro-rated billing
+   - Usage limits updated instantly
+   - Confirmation email
+
+2. **Downgrading**
+   - Continues until end of billing period
+   - Usage limits adjusted at next billing cycle
+   - Option to cancel downgrade
+   - Confirmation email
+
+### Cancellation Process
+
+1. **User Initiated**
+   - Access until end of billing period
+   - Option to reactivate
+   - Data retention policy
+   - Exit survey
+
+2. **Payment Failure**
+   - 3-day grace period
+   - Multiple payment attempts
+   - Automatic downgrade to free tier
+   - Reactivation process
+
+## Troubleshooting
+
+### Common Issues
+
+1. **OAuth Flow Issues**:
+   - Verify Redirect URL matches exactly
+   - Check all required scopes are added
+   - Ensure environment variables are set correctly
+
+2. **PDF Processing Issues**:
+   - Check file size limits
+   - Verify PDF is not password protected
+   - Ensure PDF contains extractable text
+
+3. **Authentication Issues**:
+   - Verify JWT secret is set
+   - Check cookie settings
+   - Ensure HTTPS is used in production
+
+### Logging
+
+- Application logs are available in the console
+- Debug level logging is enabled by default
+- Check logs for detailed error information
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a Pull Request
 
 ## License
 
-MIT License 
+This project is licensed under the MIT License - see the LICENSE file for details.
 
-## How to test
 
-Start the application again:
-Apply to README.md
-Run
-uvicorn app:app --reload
-Visit these endpoints in your browser:
-http://localhost:8000/ - Basic health check
-http://localhost:8000/health - Detailed health check
-http://localhost:8000/docs - Interactive API documentation (Swagger UI)
-http://localhost:8000/redoc - Alternative API documentation
-The health check endpoints will help you verify that:
-The application is running
-Environment variables are properly loaded
-Database connection is working
-Generating - JWT  - python3 -c "import secrets; print(secrets.token_hex(32))"
+## Do not remove  - Reference material
+https://reviewnudgebot.com/blog/checklist-build-and-monetize-slack-bot-in-2024/
 
-### Slack App Configuration
-1. **Basic Information**
-   - Set app name and description
-   - Upload app icon
-   - Set app URL to your domain
 
-2. **App Home**
-   - Enable "Home Tab"
-   - Set "Messages Tab" to "Enabled"
-   - Configure "App Home" view:
-     ```json
-     {
-       "type": "home",
-       "blocks": [
-         {
-           "type": "section",
-           "text": {
-             "type": "mrkdwn",
-             "text": "Welcome to PDF Summarizer! Click below to get started."
-           }
-         },
-         {
-           "type": "actions",
-           "elements": [
-             {
-               "type": "button",
-               "text": {
-                 "type": "plain_text",
-                 "text": "Login with Slack"
-               },
-               "action_id": "login_button"
-             }
-           ]
-         }
-       ]
-     }
-     ```
+## how to run the server
 
-3. **OAuth & Permissions**
-   - Add required scopes (listed above)
-   - Set redirect URL to your callback endpoint
-   - Install app to workspace
+ uvicorn app:app --reload
 
-4. **Event Subscriptions**
-   - Enable events
-   - Set request URL
-   - Subscribe to events:
-     - `app_home_opened`
-     - `app_mention`
-     - `message.im` (for direct messages)
+ To test locally
+ http://127.0.0.1:4040/inspect/http
 
-### Login Flow
-1. **App Home Access**
-   - User clicks app in Slack sidebar
-   - App home opens with login button
-   - User clicks "Login with Slack"
-   - OAuth flow initiates
-
-2. **OAuth Process**
-   - User authorizes app
-   - Redirects back to app home
-   - Updates app home view with dashboard
-   - Stores session in secure cookie
-
-3. **Session Management**
-   - JWT token stored in secure cookie
-   - App home view updates based on auth status
-   - Automatic token refresh
-   - Session invalidation on logout
-
-### App Home Views
-1. **Unauthenticated View**
-   ```json
-   {
-     "type": "home",
-     "blocks": [
-       {
-         "type": "section",
-         "text": {
-           "type": "mrkdwn",
-           "text": "Welcome to PDF Summarizer!"
-         }
-       },
-       {
-         "type": "actions",
-         "elements": [
-           {
-             "type": "button",
-             "text": {
-               "type": "plain_text",
-               "text": "Login with Slack"
-             },
-             "action_id": "login_button"
-           }
-         ]
-       }
-     ]
-   }
-   ```
-
-2. **Authenticated View**
-   ```json
-   {
-     "type": "home",
-     "blocks": [
-       {
-         "type": "section",
-         "text": {
-           "type": "mrkdwn",
-           "text": "Welcome back, <@{user_id}>!"
-         }
-       },
-       {
-         "type": "section",
-         "text": {
-           "type": "mrkdwn",
-           "text": "Your usage this month: {usage_count}/10"
-         }
-       },
-       {
-         "type": "actions",
-         "elements": [
-           {
-             "type": "button",
-             "text": {
-               "type": "plain_text",
-               "text": "Upgrade to Pro"
-             },
-             "action_id": "upgrade_button"
-           }
-         ]
-       }
-     ]
-   }
-   ```
-
-### Testing App Home & Login Flows
-
-1. **Setup Testing Environment**
-   ```bash
-   # Start the application
-   uvicorn app:app --reload
-
-   # In a new terminal, start ngrok
-   ngrok http 8000
-
-   # Update your .env with the new ngrok URL
-   SLACK_REDIRECT_URI=https://your-ngrok-url/slack/oauth/callback
-   ```
-
-2. **Test App Home Views**
-   a. **Unauthenticated View**
-   - Click app in Slack sidebar
-   - Verify welcome message appears
-   - Check "Login with Slack" button is present
-   - Click button to verify modal opens
-   - Verify OAuth URL is correct in modal
-
-   b. **Authenticated View**
-   - Complete OAuth flow
-   - Return to app home
-   - Verify welcome back message with user mention
-   - Check usage counter is displayed
-   - Verify upgrade button is present
-
-3. **Test Login Flow**
-   a. **Initial Login**
-   ```bash
-   # 1. Click app in Slack sidebar
-   # 2. Click "Login with Slack" button
-   # 3. Authorize app in Slack
-   # 4. Verify redirect to app home
-   # 5. Check authenticated view appears
-   ```
-
-   b. **Session Management**
-   ```bash
-   # 1. Close and reopen app home
-   # 2. Verify still logged in
-   # 3. Check JWT token in cookies
-   # 4. Test token expiration (24 hours)
-   ```
-
-4. **Test Error Scenarios**
-   a. **OAuth Errors**
-   - Test with invalid client ID
-   - Test with incorrect redirect URI
-   - Test with missing scopes
-   - Verify error messages are clear
-
-   b. **App Home Errors**
-   - Test with network issues
-   - Test with invalid user ID
-   - Test with missing permissions
-   - Check error handling in logs
-
-5. **Verify Database Updates**
-   ```bash
-   # Check user record creation
-   cat db.json | grep "user_id"
-
-   # Verify email storage
-   cat db.json | grep "email"
-
-   # Check team_id storage
-   cat db.json | grep "team_id"
-   ```
-
-6. **Test Workspace Features**
-   a. **Multi-workspace Support**
-   - Install app in different workspace
-   - Verify separate user records
-   - Check workspace-specific usage limits
-   - Test cross-workspace isolation
-
-   b. **Workspace Permissions**
-   - Test with different user roles
-   - Verify admin access
-   - Check workspace-level settings
-   - Test workspace-wide limits
-
-7. **Monitor Logs**
-   ```bash
-   # Watch application logs
-   tail -f app.log
-
-   # Expected log entries:
-   # - App home opened
-   # - OAuth callback received
-   # - User info retrieved
-   # - View updates published
-   ```
-
-8. **Common Test Cases**
-   ```bash
-   # Test Case 1: New User Login
-   1. Open app home
-   2. Click login
-   3. Complete OAuth
-   4. Verify new user record
-   5. Check welcome message
-
-   # Test Case 2: Existing User Login
-   1. Open app home
-   2. Click login
-   3. Complete OAuth
-   4. Verify updated last_login
-   5. Check usage stats
-
-   # Test Case 3: Session Expiry
-   1. Login successfully
-   2. Wait for token expiry
-   3. Try to access protected route
-   4. Verify redirect to login
-   5. Check new token generation
-   ```
-
-9. **Troubleshooting**
-   ```bash
-   # Check Slack API responses
-   curl -X POST https://slack.com/api/apps.event.authorizations.list \
-     -H "Authorization: Bearer $SLACK_BOT_TOKEN"
-
-   # Verify OAuth configuration
-   curl -X GET https://slack.com/api/oauth.v2.access \
-     -H "Authorization: Bearer $SLACK_BOT_TOKEN"
-
-   # Test app home publishing
-   curl -X POST https://slack.com/api/views.publish \
-     -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
-     -H "Content-type: application/json" \
-     -d '{"user_id":"USER_ID","view":{"type":"home"}}'
-   ```
-
-10. **Security Testing**
-    - Verify JWT token security
-    - Test CSRF protection
-    - Check cookie settings
-    - Validate input sanitization
-    - Test rate limiting
-    - Verify HTTPS enforcement
-
-Remember to:
-- Test on different devices/browsers
-- Verify mobile app compatibility
-- Check accessibility features
-- Test with different user roles
-- Monitor performance metrics
-- Document any issues found
